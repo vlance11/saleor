@@ -1,0 +1,1487 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+#################################
+# CONFIG
+#################################
+
+# VPS identity
+SERVER_IP=""
+SERVER_DOMAIN="server-saleor.tjdd.org"
+
+# Bootstrap (OVH default)
+BOOT_USER="ubuntu"
+BOOT_PORT=22
+BOOT_PASSWORD="${BOOT_PASSWORD:-}"   # export BOOT_PASSWORD before running tryconfig
+# Runner sudo password (used by setupdev/init/status/security)
+SUDO_PASSWORD="${SUDO_PASSWORD:-}"   # export SUDO_PASSWORD before running commands
+# Final SSH config
+RUNNER_USER="runner"
+NEW_SSH_PORT=17380
+
+# Host config
+HOSTNAME_FQDN="server-saleor.tjdd.org"
+TIMEZONE="UTC"
+
+# SSH
+LOCAL_SSH_KEY="$HOME/.ssh/id_ed25519.pub"
+LOCAL_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LOCAL_SALEOR_DIR="$LOCAL_REPO_ROOT/saleor"
+REMOTE_REPO_ROOT="${REMOTE_REPO_ROOT:-/home/$RUNNER_USER/saleor}"
+REMOTE_ENV_FILE="${REMOTE_ENV_FILE:-saleor/.env}"
+REMOTE_SYNC_MANIFEST_FILE=".saleor_last_synced_manifest.sha256"
+REMOTE_CURRENT_MANIFEST_FILE=".saleor_current_manifest.sha256"
+RUNNER_HOST_CACHE=""
+
+#################################
+# INTERNAL
+#################################
+
+require_key() {
+  if [ ! -f "$LOCAL_SSH_KEY" ]; then
+    echo "❌ Missing SSH key: $LOCAL_SSH_KEY"
+    exit 1
+  fi
+}
+
+require_sudo_password() {
+  if [ -z "${SUDO_PASSWORD:-}" ]; then
+    echo "❌ Missing SUDO_PASSWORD in GameServer/connect.sh"
+    exit 1
+  fi
+}
+
+resolve_runner_host() {
+  if [ -n "$RUNNER_HOST_CACHE" ]; then
+    printf '%s' "$RUNNER_HOST_CACHE"
+    return 0
+  fi
+
+  local probe_output
+  if probe_output="$(ssh -n -o BatchMode=yes -o ConnectTimeout=5 -p "$NEW_SSH_PORT" "$RUNNER_USER@$SERVER_DOMAIN" "exit 0" </dev/null 2>&1)"; then
+    RUNNER_HOST_CACHE="$SERVER_DOMAIN"
+  else
+    if printf '%s' "$probe_output" | grep -qi "Could not resolve hostname"; then
+      echo "⚠️  Could not resolve $SERVER_DOMAIN, using $SERVER_IP fallback for this run." >&2
+      RUNNER_HOST_CACHE="$SERVER_IP"
+    else
+      RUNNER_HOST_CACHE="$SERVER_DOMAIN"
+    fi
+  fi
+
+  printf '%s' "$RUNNER_HOST_CACHE"
+}
+
+runner_ssh_target() {
+  printf '%s@%s' "$RUNNER_USER" "$(resolve_runner_host)"
+}
+
+ssh_bootstrap() {
+  sshpass -p "$BOOT_PASSWORD" ssh \
+    -o StrictHostKeyChecking=no \
+    -p "$BOOT_PORT" \
+    "$BOOT_USER@$SERVER_IP" "$@"
+}
+
+ssh_runner() {
+  local target
+  target="$(runner_ssh_target)"
+  ssh -p "$NEW_SSH_PORT" "$target" "$@"
+}
+
+ssh_runner_script() {
+  require_sudo_password
+  local quoted_sudo_password
+  local target
+  target="$(runner_ssh_target)"
+  quoted_sudo_password="$(printf '%q' "$SUDO_PASSWORD")"
+  ssh -p "$NEW_SSH_PORT" "$target" "SUDO_PASSWORD=$quoted_sudo_password bash -se"
+}
+
+ssh_runner_env_script() {
+  local quoted_repo_root quoted_env_file quoted_sync_manifest quoted_current_manifest
+  local target
+  target="$(runner_ssh_target)"
+  quoted_repo_root="$(printf '%q' "$REMOTE_REPO_ROOT")"
+  quoted_env_file="$(printf '%q' "$REMOTE_ENV_FILE")"
+  quoted_sync_manifest="$(printf '%q' "$REMOTE_SYNC_MANIFEST_FILE")"
+  quoted_current_manifest="$(printf '%q' "$REMOTE_CURRENT_MANIFEST_FILE")"
+  ssh -p "$NEW_SSH_PORT" "$target" \
+    "REMOTE_REPO_ROOT=$quoted_repo_root REMOTE_ENV_FILE=$quoted_env_file REMOTE_SYNC_MANIFEST_FILE=$quoted_sync_manifest REMOTE_CURRENT_MANIFEST_FILE=$quoted_current_manifest bash -se"
+}
+
+require_local_repo() {
+  if [ ! -d "$LOCAL_REPO_ROOT" ]; then
+    echo "❌ Local repo root missing: $LOCAL_REPO_ROOT"
+    exit 1
+  fi
+  if [ ! -f "$LOCAL_REPO_ROOT/Makefile" ]; then
+    echo "❌ Missing local Makefile in: $LOCAL_REPO_ROOT"
+    exit 1
+  fi
+  if [ ! -f "$LOCAL_REPO_ROOT/api.txt" ]; then
+    echo "❌ Missing local api.txt in: $LOCAL_REPO_ROOT"
+    exit 1
+  fi
+  if [ ! -d "$LOCAL_GAMESERVER_DIR" ]; then
+    echo "❌ Missing local GameServer dir: $LOCAL_GAMESERVER_DIR"
+    exit 1
+  fi
+  if [ ! -f "$LOCAL_REPO_ROOT/FastFingersBackend/functions/src/index.ts" ]; then
+    echo "❌ Missing local index.ts spec: $LOCAL_REPO_ROOT/FastFingersBackend/functions/src/index.ts"
+    exit 1
+  fi
+}
+
+local_mobile_app_version() {
+  local pubspec="$LOCAL_REPO_ROOT/FastFingers/pubspec.yaml"
+  if [ ! -f "$pubspec" ]; then
+    echo ""
+    return 0
+  fi
+  awk -F': ' '/^version:[[:space:]]*/{print $2; exit}' "$pubspec" | tr -d '\r'
+}
+
+build_local_manifest() {
+  local output_file="$1"
+  (
+    cd "$LOCAL_REPO_ROOT"
+    {
+      [ -f "Makefile" ] && echo "Makefile"
+      [ -f "api.txt" ] && echo "api.txt"
+      [ -f "FastFingersBackend/functions/src/index.ts" ] && echo "FastFingersBackend/functions/src/index.ts"
+      find GameServer -type f \
+        ! -path 'GameServer/docker/.env' \
+        ! -path 'GameServer/api/.env' \
+        ! -path 'GameServer/api/.env.*' \
+        ! -path 'GameServer/docker/cloudflared/*.json' \
+        ! -path 'GameServer/api/node_modules/*' \
+        ! -path 'GameServer/api/dist/*' \
+        ! -path 'GameServer/web/node_modules/*' \
+        ! -path 'GameServer/web/.next/*' \
+        ! -path 'GameServer/reports/*' \
+        ! -name '.DS_Store'
+    } | LC_ALL=C sort -u | while IFS= read -r rel; do
+      [ -f "$rel" ] || continue
+      hash="$(shasum -a 256 "$rel" | awk '{print $1}')"
+      printf "%s  %s\n" "$hash" "$rel"
+    done
+  ) > "$output_file"
+}
+
+#################################
+# 1️⃣ TRYCONFIG — SSH CUTOVER
+#################################
+
+tryconfig() {
+  require_key
+  PUBKEY="$(cat "$LOCAL_SSH_KEY")"
+
+  echo "🚨 RUNNING SSH CUTOVER (THIS WILL KICK YOU OUT)"
+  echo ""
+
+  ssh_bootstrap bash <<EOF
+set -e
+
+# Kill bootstrap password
+echo "$BOOT_USER:\$(openssl rand -base64 32)" | sudo chpasswd
+
+# Create runner user
+id "$RUNNER_USER" >/dev/null 2>&1 || sudo adduser --disabled-password --gecos "" "$RUNNER_USER"
+sudo usermod -aG sudo "$RUNNER_USER"
+
+# Install SSH key
+sudo mkdir -p /home/$RUNNER_USER/.ssh
+echo "$PUBKEY" | sudo tee /home/$RUNNER_USER/.ssh/authorized_keys >/dev/null
+sudo chown -R $RUNNER_USER:$RUNNER_USER /home/$RUNNER_USER/.ssh
+sudo chmod 700 /home/$RUNNER_USER/.ssh
+sudo chmod 600 /home/$RUNNER_USER/.ssh/authorized_keys
+
+# SSH hardening
+sudo sed -i "s/^#\\?Port .*/Port $NEW_SSH_PORT/" /etc/ssh/sshd_config
+sudo sed -i "s/^#\\?PasswordAuthentication.*/PasswordAuthentication no/" /etc/ssh/sshd_config
+sudo sed -i "s/^#\\?PermitRootLogin.*/PermitRootLogin no/" /etc/ssh/sshd_config
+grep -q "^AllowUsers" /etc/ssh/sshd_config || echo "AllowUsers $RUNNER_USER" | sudo tee -a /etc/ssh/sshd_config
+
+# Firewall (SSH ONLY)
+sudo ufw --force reset
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+sudo ufw allow $NEW_SSH_PORT/tcp
+sudo ufw --force enable
+
+sudo systemctl restart ssh
+EOF
+
+  echo ""
+  echo "✅ TRYCONFIG COMPLETE"
+  echo ""
+  echo "👉 NOW TEST (DO NOT PROCEED UNTIL THIS WORKS):"
+  echo "ssh -p $NEW_SSH_PORT $RUNNER_USER@$SERVER_DOMAIN"
+}
+
+#################################
+# 2️⃣ SETUPDEV — SHELL UX ONLY
+#################################
+
+setupdev() {
+  ssh_runner_script <<'EOF'
+set -e
+
+if [ -z "${SUDO_PASSWORD:-}" ]; then
+  echo "❌ Missing SUDO_PASSWORD in remote session"
+  exit 1
+fi
+
+sudo_cmd() {
+  printf '%s\n' "$SUDO_PASSWORD" | sudo -S -p '' "$@"
+}
+
+if ! sudo_cmd -v >/dev/null 2>&1; then
+  echo "❌ sudo authentication failed for RUNNER_USER with provided SUDO_PASSWORD"
+  exit 1
+fi
+
+export DEBIAN_FRONTEND=noninteractive
+
+#################################
+# PACKAGES
+#################################
+
+sudo_cmd apt-get update
+sudo_cmd apt-get install -y \
+  zsh \
+  git \
+  curl \
+  nano \
+  fzf \
+  bat \
+  ripgrep \
+  tmux
+
+#################################
+# DEFAULT SHELL
+#################################
+
+ZSH_BIN="$(command -v zsh)"
+CURRENT_LOGIN_SHELL="$(getent passwd "$USER" | cut -d: -f7)"
+if [ "$CURRENT_LOGIN_SHELL" != "$ZSH_BIN" ]; then
+  sudo_cmd usermod --shell "$ZSH_BIN" "$USER"
+fi
+
+#################################
+# OH-MY-ZSH
+#################################
+
+if [ ! -d "$HOME/.oh-my-zsh" ]; then
+  RUNZSH=no KEEP_ZSHRC=yes \
+    sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)"
+fi
+
+#################################
+# ZSH PLUGINS
+#################################
+
+ZSH_CUSTOM="$HOME/.oh-my-zsh/custom"
+
+if [ ! -d "$ZSH_CUSTOM/plugins/zsh-autosuggestions" ]; then
+  git clone https://github.com/zsh-users/zsh-autosuggestions \
+    "$ZSH_CUSTOM/plugins/zsh-autosuggestions"
+fi
+
+if [ ! -d "$ZSH_CUSTOM/plugins/zsh-syntax-highlighting" ]; then
+  git clone https://github.com/zsh-users/zsh-syntax-highlighting.git \
+    "$ZSH_CUSTOM/plugins/zsh-syntax-highlighting"
+fi
+
+if [ ! -d "$ZSH_CUSTOM/plugins/history-substring-search" ]; then
+  git clone --depth 1 https://github.com/zsh-users/zsh-history-substring-search.git \
+    "$ZSH_CUSTOM/plugins/history-substring-search"
+fi
+
+#################################
+# .ZSHRC (PRODUCTION-GRADE)
+#################################
+
+cat <<'ZRC' > ~/.zshrc
+export ZSH="$HOME/.oh-my-zsh"
+ZSH_THEME="robbyrussell"
+
+plugins=(
+  git
+  docker
+  docker-compose
+  sudo
+  extract
+  history
+  zsh-autosuggestions
+  zsh-syntax-highlighting
+  history-substring-search
+)
+
+source $ZSH/oh-my-zsh.sh
+
+# History
+export HISTSIZE=200000
+export SAVEHIST=200000
+export HISTFILE=~/.zsh_history
+setopt append_history
+setopt share_history
+setopt hist_ignore_dups
+setopt hist_ignore_space
+setopt hist_reduce_blanks
+setopt inc_append_history
+setopt extended_history
+
+# Safety
+set -o noclobber
+set -o notify
+setopt correct
+setopt interactive_comments
+
+# Keybindings
+bindkey -e
+bindkey '^[[A' history-substring-search-up
+bindkey '^[[B' history-substring-search-down
+
+# Completion
+autoload -Uz compinit
+compinit
+zstyle ':completion:*' menu select
+zstyle ':completion:*' matcher-list 'm:{a-z}={A-Za-z}'
+
+# Editor
+export EDITOR=nano
+export VISUAL=nano
+
+# Aliases
+alias ll='ls -lah --color=auto'
+alias dfh='df -h'
+alias duh='du -h -d 1'
+alias dps='docker ps'
+alias dcu='docker compose up -d'
+alias dcd='docker compose down'
+alias dcl='docker compose logs -f'
+
+# Path
+export PATH="$HOME/.local/bin:$PATH"
+ZRC
+
+#################################
+# SSH QUALITY OF LIFE
+#################################
+
+mkdir -p ~/.ssh
+chmod 700 ~/.ssh
+
+cat <<'SSHCFG' >> ~/.ssh/config
+Host *
+  ServerAliveInterval 30
+  ServerAliveCountMax 3
+  TCPKeepAlive yes
+  ForwardAgent no
+SSHCFG
+
+chmod 600 ~/.ssh/config
+
+echo "✅ Production shell environment ready"
+echo "➡️  Log out and log back in (or reconnect) to activate zsh"
+EOF
+}
+
+#################################
+# 3️⃣ INIT — SERVER RUNTIME
+#################################
+
+init() {
+  ssh_runner_script <<EOF
+set -e
+
+if [ -z "\${SUDO_PASSWORD:-}" ]; then
+  echo "❌ Missing SUDO_PASSWORD in remote session"
+  exit 1
+fi
+
+sudo_cmd() {
+  printf '%s\n' "\$SUDO_PASSWORD" | sudo -S -p '' "\$@"
+}
+
+if ! sudo_cmd -v >/dev/null 2>&1; then
+  echo "❌ sudo authentication failed for RUNNER_USER with provided SUDO_PASSWORD"
+  exit 1
+fi
+
+export DEBIAN_FRONTEND=noninteractive
+
+sudo_cmd timedatectl set-timezone "$TIMEZONE"
+sudo_cmd hostnamectl set-hostname "$HOSTNAME_FQDN"
+
+sudo_cmd apt-get update
+sudo_cmd apt-get upgrade -y
+sudo_cmd apt-get install -y \
+  ca-certificates \
+  curl \
+  gnupg \
+  lsb-release \
+  ufw \
+  fail2ban \
+  git \
+  htop \
+  iotop \
+  ncdu \
+  unzip \
+  jq
+
+# Docker
+if ! command -v docker >/dev/null; then
+  curl -fsSL https://get.docker.com | sudo_cmd sh
+fi
+
+sudo_cmd systemctl enable docker
+sudo_cmd systemctl start docker
+sudo_cmd usermod -aG docker "$RUNNER_USER"
+
+# Docker Compose plugin
+mkdir -p ~/.docker/cli-plugins
+curl -SL https://github.com/docker/compose/releases/download/v2.25.0/docker-compose-linux-x86_64 \
+  -o ~/.docker/cli-plugins/docker-compose
+chmod +x ~/.docker/cli-plugins/docker-compose
+
+# Fail2ban
+sudo_cmd systemctl enable fail2ban
+sudo_cmd systemctl start fail2ban
+
+# Kernel hardening
+sudo_cmd sysctl -w net.ipv4.ip_forward=0
+sudo_cmd sysctl -w net.ipv4.conf.all.accept_redirects=0
+sudo_cmd sysctl -w net.ipv4.conf.all.send_redirects=0
+sudo_cmd sysctl -w net.ipv4.conf.all.accept_source_route=0
+sudo_cmd sysctl -w net.ipv4.conf.all.log_martians=1
+
+echo "✅ INIT COMPLETE"
+EOF
+}
+
+#################################
+# OPS COMMANDS
+#################################
+
+status() {
+  ssh_runner_script <<'EOF'
+uptime
+docker ps || true
+
+if [ -z "${SUDO_PASSWORD:-}" ]; then
+  echo "❌ Missing SUDO_PASSWORD in remote session"
+  exit 1
+fi
+
+sudo_cmd() {
+  printf '%s\n' "$SUDO_PASSWORD" | sudo -S -p '' "$@"
+}
+
+sudo_cmd ufw status verbose
+EOF
+}
+
+security() {
+  ssh_runner_script <<'EOF'
+if [ -z "${SUDO_PASSWORD:-}" ]; then
+  echo "❌ Missing SUDO_PASSWORD in remote session"
+  exit 1
+fi
+
+sudo_cmd() {
+  printf '%s\n' "$SUDO_PASSWORD" | sudo -S -p '' "$@"
+}
+
+sudo_cmd ss -tulpn
+sudo_cmd journalctl -u ssh --since "24 hours ago" || true
+sudo_cmd fail2ban-client status sshd || true
+EOF
+}
+
+resources() {
+  ssh_runner bash <<'EOF'
+lscpu | grep 'Model name'
+free -h
+df -h
+ps aux --sort=-%cpu | head -10
+EOF
+}
+
+update() {
+  ssh_runner_script <<'EOF'
+set -e
+
+if [ -z "${SUDO_PASSWORD:-}" ]; then
+  echo "❌ Missing SUDO_PASSWORD in remote session"
+  exit 1
+fi
+
+sudo_cmd() {
+  printf '%s\n' "$SUDO_PASSWORD" | sudo -S -p '' "$@"
+}
+
+if ! sudo_cmd -v >/dev/null 2>&1; then
+  echo "❌ sudo authentication failed for RUNNER_USER with provided SUDO_PASSWORD"
+  exit 1
+fi
+
+export DEBIAN_FRONTEND=noninteractive
+
+sudo_cmd apt-get update
+sudo_cmd apt-get upgrade -y
+sudo_cmd apt-get full-upgrade -y
+sudo_cmd apt-get autoremove -y --purge
+sudo_cmd apt-get autoclean
+
+echo "✅ PACKAGE UPDATE COMPLETE"
+EOF
+}
+
+release_upgrade() {
+  echo "🚨 Starting Ubuntu release upgrade. SSH may disconnect during this process."
+  ssh_runner_script <<'EOF'
+set -e
+
+if [ -z "${SUDO_PASSWORD:-}" ]; then
+  echo "❌ Missing SUDO_PASSWORD in remote session"
+  exit 1
+fi
+
+sudo_cmd() {
+  printf '%s\n' "$SUDO_PASSWORD" | sudo -S -p '' "$@"
+}
+
+if ! sudo_cmd -v >/dev/null 2>&1; then
+  echo "❌ sudo authentication failed for RUNNER_USER with provided SUDO_PASSWORD"
+  exit 1
+fi
+
+export DEBIAN_FRONTEND=noninteractive
+
+sudo_cmd apt-get update
+sudo_cmd apt-get install -y update-manager-core ubuntu-release-upgrader-core
+sudo_cmd sed -i 's/^Prompt=.*/Prompt=normal/' /etc/update-manager/release-upgrades
+sudo_cmd do-release-upgrade -f DistUpgradeViewNonInteractive -m server
+
+echo "✅ RELEASE UPGRADE COMPLETE"
+EOF
+}
+
+#################################
+# REMOTE GAME SERVER WORKFLOW
+#################################
+
+remote_prepare_workspace() {
+  ssh_runner_env_script <<'EOF'
+set -e
+mkdir -p "$REMOTE_REPO_ROOT"
+mkdir -p "$REMOTE_REPO_ROOT/GameServer"
+mkdir -p "$REMOTE_REPO_ROOT/FastFingersBackend/functions/src"
+EOF
+}
+
+remote_generate_manifest() {
+  ssh_runner_env_script <<'EOF'
+set -e
+cd "$REMOTE_REPO_ROOT"
+{
+  [ -f "Makefile" ] && echo "Makefile"
+  [ -f "api.txt" ] && echo "api.txt"
+  [ -f "FastFingersBackend/functions/src/index.ts" ] && echo "FastFingersBackend/functions/src/index.ts"
+  find GameServer -type f \
+    ! -path 'GameServer/docker/.env' \
+    ! -path 'GameServer/api/.env' \
+    ! -path 'GameServer/api/.env.*' \
+    ! -path 'GameServer/docker/cloudflared/*.json' \
+    ! -path 'GameServer/api/node_modules/*' \
+    ! -path 'GameServer/api/dist/*' \
+    ! -path 'GameServer/web/node_modules/*' \
+    ! -path 'GameServer/web/.next/*' \
+    ! -path 'GameServer/reports/*' \
+    ! -name '.DS_Store'
+} | LC_ALL=C sort -u | while IFS= read -r rel; do
+  [ -f "$rel" ] || continue
+  sha256sum "$rel"
+done > "$REMOTE_CURRENT_MANIFEST_FILE"
+EOF
+}
+
+remote_drift() {
+  remote_prepare_workspace
+  ssh_runner_env_script <<'EOF'
+set -e
+cd "$REMOTE_REPO_ROOT"
+
+if [ ! -f "$REMOTE_SYNC_MANIFEST_FILE" ]; then
+  echo "ℹ️  No remote baseline manifest found yet ($REMOTE_SYNC_MANIFEST_FILE)."
+  exit 3
+fi
+
+{
+  [ -f "Makefile" ] && echo "Makefile"
+  [ -f "api.txt" ] && echo "api.txt"
+  [ -f "FastFingersBackend/functions/src/index.ts" ] && echo "FastFingersBackend/functions/src/index.ts"
+  find GameServer -type f \
+    ! -path 'GameServer/docker/.env' \
+    ! -path 'GameServer/api/.env' \
+    ! -path 'GameServer/api/.env.*' \
+    ! -path 'GameServer/docker/cloudflared/*.json' \
+    ! -path 'GameServer/api/node_modules/*' \
+    ! -path 'GameServer/api/dist/*' \
+    ! -path 'GameServer/web/node_modules/*' \
+    ! -path 'GameServer/web/.next/*' \
+    ! -path 'GameServer/reports/*' \
+    ! -name '.DS_Store'
+} | LC_ALL=C sort -u | while IFS= read -r rel; do
+  [ -f "$rel" ] || continue
+  sha256sum "$rel"
+done > "$REMOTE_CURRENT_MANIFEST_FILE"
+
+if diff -u "$REMOTE_SYNC_MANIFEST_FILE" "$REMOTE_CURRENT_MANIFEST_FILE" > /tmp/gameserver_manifest.diff; then
+  echo "✅ Remote workspace clean (no server-side drift since last sync)."
+  exit 0
+fi
+
+echo "❌ Remote drift detected since last sync:"
+cat /tmp/gameserver_manifest.diff
+exit 2
+EOF
+}
+
+sync_remote() {
+  require_local_repo
+  local target
+  target="$(runner_ssh_target)"
+  if ! command -v rsync >/dev/null 2>&1; then
+    echo "❌ rsync is required locally."
+    exit 1
+  fi
+
+  remote_prepare_workspace
+
+  echo "🔎 Checking remote drift before sync..."
+  if remote_drift; then
+    :
+  else
+    rc=$?
+    if [ "$rc" -eq 3 ]; then
+      echo "ℹ️  First sync (no remote baseline yet)."
+    else
+      echo "❌ Refusing sync due to remote drift. Run './GameServer/connect.sh remote-drift' and resolve."
+      exit "$rc"
+    fi
+  fi
+
+  echo "📦 Syncing Makefile..."
+  rsync -az -e "ssh -p $NEW_SSH_PORT" \
+    "$LOCAL_REPO_ROOT/Makefile" \
+    "$target:$REMOTE_REPO_ROOT/Makefile"
+
+  echo "📦 Syncing api.txt..."
+  rsync -az -e "ssh -p $NEW_SSH_PORT" \
+    "$LOCAL_REPO_ROOT/api.txt" \
+    "$target:$REMOTE_REPO_ROOT/api.txt"
+
+  echo "📦 Syncing GameServer workspace..."
+  rsync -az --delete -e "ssh -p $NEW_SSH_PORT" \
+    --exclude '.git/' \
+    --exclude '.DS_Store' \
+    --exclude 'docker/.env' \
+    --exclude 'api/.env' \
+    --exclude 'api/.env.*' \
+    --exclude 'docker/cloudflared/*.json' \
+    --exclude 'api/node_modules/' \
+    --exclude 'api/dist/' \
+    --exclude 'web/node_modules/' \
+    --exclude 'web/.next/' \
+    --exclude '/reports/' \
+    "$LOCAL_GAMESERVER_DIR/" \
+    "$target:$REMOTE_REPO_ROOT/GameServer/"
+
+  echo "📦 Syncing index.ts spec snapshot..."
+  rsync -az -e "ssh -p $NEW_SSH_PORT" \
+    "$LOCAL_REPO_ROOT/FastFingersBackend/functions/src/index.ts" \
+    "$target:$REMOTE_REPO_ROOT/FastFingersBackend/functions/src/index.ts"
+
+  tmp_manifest="$(mktemp)"
+  build_local_manifest "$tmp_manifest"
+  scp -P "$NEW_SSH_PORT" "$tmp_manifest" \
+    "$target:$REMOTE_REPO_ROOT/$REMOTE_SYNC_MANIFEST_FILE" >/dev/null
+  rm -f "$tmp_manifest"
+
+  remote_generate_manifest >/dev/null
+  echo "✅ Remote sync complete: $target:$REMOTE_REPO_ROOT"
+}
+
+sync_remote_force() {
+  require_local_repo
+  local target
+  target="$(runner_ssh_target)"
+  if ! command -v rsync >/dev/null 2>&1; then
+    echo "❌ rsync is required locally."
+    exit 1
+  fi
+  remote_prepare_workspace
+  echo "⚠️  FORCE sync: skipping remote drift check."
+
+  rsync -az -e "ssh -p $NEW_SSH_PORT" \
+    "$LOCAL_REPO_ROOT/Makefile" \
+    "$target:$REMOTE_REPO_ROOT/Makefile"
+
+  rsync -az -e "ssh -p $NEW_SSH_PORT" \
+    "$LOCAL_REPO_ROOT/api.txt" \
+    "$target:$REMOTE_REPO_ROOT/api.txt"
+
+  rsync -az --delete -e "ssh -p $NEW_SSH_PORT" \
+    --exclude '.git/' \
+    --exclude '.DS_Store' \
+    --exclude 'docker/.env' \
+    --exclude 'api/.env' \
+    --exclude 'api/.env.*' \
+    --exclude 'docker/cloudflared/*.json' \
+    --exclude 'api/node_modules/' \
+    --exclude 'api/dist/' \
+    --exclude 'web/node_modules/' \
+    --exclude 'web/.next/' \
+    --exclude '/reports/' \
+    "$LOCAL_GAMESERVER_DIR/" \
+    "$target:$REMOTE_REPO_ROOT/GameServer/"
+
+  rsync -az -e "ssh -p $NEW_SSH_PORT" \
+    "$LOCAL_REPO_ROOT/FastFingersBackend/functions/src/index.ts" \
+    "$target:$REMOTE_REPO_ROOT/FastFingersBackend/functions/src/index.ts"
+
+  tmp_manifest="$(mktemp)"
+  build_local_manifest "$tmp_manifest"
+  scp -P "$NEW_SSH_PORT" "$tmp_manifest" \
+    "$target:$REMOTE_REPO_ROOT/$REMOTE_SYNC_MANIFEST_FILE" >/dev/null
+  rm -f "$tmp_manifest"
+
+  remote_generate_manifest >/dev/null
+  echo "✅ Remote force sync complete: $target:$REMOTE_REPO_ROOT"
+}
+
+remote_make() {
+  local target="$1"
+  local app_version
+  app_version="$(local_mobile_app_version)"
+  if [ -z "$app_version" ]; then
+    app_version="unknown"
+  fi
+  echo "➡️ Running remote target: $target"
+  ssh_runner_env_script <<EOF
+set -e
+cd "$REMOTE_REPO_ROOT"
+echo "remote cwd: \$PWD"
+FASTFINGERS_APP_VERSION="$app_version" make GAMESERVER_ENV_FILE="$REMOTE_ENV_FILE" ALLOW_MISSING_FLUTTER_APP=1 "$target"
+EOF
+}
+
+remote_env_push() {
+  require_local_repo
+  local local_env_file="$LOCAL_GAMESERVER_DIR/docker/.env"
+  local tmp_remote_env=".gameserver_env.tmp"
+  local target
+  target="$(runner_ssh_target)"
+
+  if [ ! -f "$local_env_file" ]; then
+    echo "❌ Missing local env file: $local_env_file"
+    echo "Create it from GameServer/docker/env.example first."
+    exit 1
+  fi
+
+  remote_prepare_workspace
+
+  echo "📦 Uploading local GameServer/docker/.env to remote..."
+  scp -P "$NEW_SSH_PORT" "$local_env_file" \
+    "$target:$REMOTE_REPO_ROOT/$tmp_remote_env" >/dev/null
+
+  ssh_runner_env_script <<'EOF'
+set -e
+
+if [[ "$REMOTE_ENV_FILE" = /* ]]; then
+  env_path="$REMOTE_ENV_FILE"
+else
+  env_path="$REMOTE_REPO_ROOT/$REMOTE_ENV_FILE"
+fi
+
+env_dir="$(dirname "$env_path")"
+mkdir -p "$env_dir"
+install -m 600 "$REMOTE_REPO_ROOT/.gameserver_env.tmp" "$env_path"
+rm -f "$REMOTE_REPO_ROOT/.gameserver_env.tmp"
+
+echo "✅ Remote env updated: $env_path"
+EOF
+}
+
+remote_env_validate() {
+  ssh_runner_env_script <<'EOF'
+set -e
+
+if [[ "$REMOTE_ENV_FILE" = /* ]]; then
+  env_path="$REMOTE_ENV_FILE"
+else
+  env_path="$REMOTE_REPO_ROOT/$REMOTE_ENV_FILE"
+fi
+
+if [ ! -f "$env_path" ]; then
+  echo "❌ Missing remote env file: $env_path"
+  exit 1
+fi
+
+fail=0
+err() {
+  echo "❌ $*"
+  fail=1
+}
+
+get_val() {
+  local key="$1"
+  local val
+  val="$(awk -F= -v k="$key" '$1==k{print substr($0, index($0, "=")+1)}' "$env_path" | tail -n 1)"
+  val="$(printf '%s' "$val" | sed -e 's/\r$//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+  val="${val#\"}"
+  val="${val%\"}"
+  val="${val#\'}"
+  val="${val%\'}"
+  printf '%s' "$val"
+}
+
+require_non_empty() {
+  local key="$1"
+  local val
+  val="$(get_val "$key")"
+  if [ -z "$val" ]; then
+    err "Missing required env key: $key"
+  fi
+}
+
+if grep -Eiq 'replace_|changeme|example' "$env_path"; then
+  err "Placeholder value found in remote env (replace_/changeme/example)."
+fi
+
+required_keys=(
+  NODE_ENV
+  PORT
+  API_BASE_PATH
+  CORS_MODE
+  FIREBASE_PROJECT_ID
+  FIREBASE_SA
+  GOOGLE_APPLICATION_CREDENTIALS
+  APP_HMAC_CURRENT_KEY
+  ALLOWED_APP_IDS
+  WEB_APP_ID
+  WEB_APP_HMAC_KEY
+  WEB_SESSION_SECRET
+  WEB_API_INTERNAL_URL
+  WEB_API_PUBLIC_URL
+  NEXT_PUBLIC_FIREBASE_API_KEY
+  NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN
+  NEXT_PUBLIC_FIREBASE_PROJECT_ID
+  NEXT_PUBLIC_FIREBASE_APP_ID
+  MONGO_URI
+  REDIS_PASSWORD
+  POSTGRES_URL
+  CLOUDFLARE_TUNNEL_TOKEN
+  REALTIME_PUBSUB_CHANNEL
+  GRAFANA_ADMIN_PASSWORD
+)
+
+for key in "${required_keys[@]}"; do
+  require_non_empty "$key"
+done
+
+cors_mode="$(get_val CORS_MODE | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+if [ "$cors_mode" != "mobile_only" ] && [ "$cors_mode" != "web_allowlist" ]; then
+  err "CORS_MODE must be mobile_only or web_allowlist"
+fi
+cors_origins="$(get_val CORS_ALLOWED_ORIGINS)"
+if [ "$cors_origins" = "*" ]; then
+  err "CORS_ALLOWED_ORIGINS cannot be '*'"
+fi
+if [ "$cors_mode" = "web_allowlist" ] && [ -z "$cors_origins" ]; then
+  err "CORS_ALLOWED_ORIGINS required when CORS_MODE=web_allowlist"
+fi
+web_host="$(get_val WEB_HOST)"
+if [ -n "$web_host" ] && ! printf '%s\n' "$cors_origins" | tr ',' '\n' | tr -d '[:space:]' | grep -Fxq "https://$web_host"; then
+  err "CORS_ALLOWED_ORIGINS must include https://$web_host for browser access"
+fi
+
+hmac_current="$(get_val APP_HMAC_CURRENT_KEY)"
+if [ "${#hmac_current}" -lt 64 ]; then
+  err "APP_HMAC_CURRENT_KEY must be at least 64 chars"
+fi
+
+web_hmac="$(get_val WEB_APP_HMAC_KEY)"
+if [ "${#web_hmac}" -lt 64 ]; then
+  err "WEB_APP_HMAC_KEY must be at least 64 chars"
+fi
+
+web_session_secret="$(get_val WEB_SESSION_SECRET)"
+if [ "${#web_session_secret}" -lt 64 ]; then
+  err "WEB_SESSION_SECRET must be at least 64 chars"
+fi
+
+allowed_app_ids="$(get_val ALLOWED_APP_IDS)"
+web_app_id="$(get_val WEB_APP_ID)"
+normalized_allowed_app_ids="$(
+  printf '%s\n' "$allowed_app_ids" | tr ',' '\n' | \
+    sed -e 's/\r$//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//" | awk 'NF'
+)"
+normalized_web_app_id="$(printf '%s' "$web_app_id" | sed -e 's/\r$//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")"
+if ! printf '%s\n' "$normalized_allowed_app_ids" | grep -Fxq "$normalized_web_app_id"; then
+  err "WEB_APP_ID ($web_app_id) must be present in ALLOWED_APP_IDS"
+fi
+
+realtime_channel="$(get_val REALTIME_PUBSUB_CHANNEL)"
+if [ "$realtime_channel" = "realtime:events" ]; then
+  err "REALTIME_PUBSUB_CHANNEL must not use default realtime:events"
+fi
+
+firebase_sa="$(get_val FIREBASE_SA)"
+env_dir="$(dirname "$env_path")"
+if [[ "$firebase_sa" = /* ]]; then
+  host_sa="$firebase_sa"
+else
+  host_sa="$(cd "$env_dir" && realpath -m "$firebase_sa")"
+fi
+if [ ! -f "$host_sa" ]; then
+  err "FIREBASE_SA host file not found: $host_sa"
+fi
+
+google_creds="$(get_val GOOGLE_APPLICATION_CREDENTIALS)"
+if [[ "$google_creds" != /* ]]; then
+  err "GOOGLE_APPLICATION_CREDENTIALS must be absolute in-container path"
+fi
+
+if [ "$fail" -ne 0 ]; then
+  echo "❌ Remote env validation failed: $env_path"
+  exit 1
+fi
+
+echo "✅ Remote env validation passed: $env_path"
+EOF
+}
+
+remote_status() {
+  local app_version
+  app_version="$(local_mobile_app_version)"
+  if [ -z "$app_version" ]; then
+    app_version="unknown"
+  fi
+  ssh_runner_env_script <<EOF
+set -e
+echo "Remote root: \$REMOTE_REPO_ROOT"
+if [ -f "\$REMOTE_REPO_ROOT/\$REMOTE_SYNC_MANIFEST_FILE" ]; then
+  echo "Sync baseline: present"
+else
+  echo "Sync baseline: missing (run sync first)"
+fi
+cd "\$REMOTE_REPO_ROOT"
+FASTFINGERS_APP_VERSION="$app_version" make GAMESERVER_ENV_FILE="\$REMOTE_ENV_FILE" gameserver-ps || true
+EOF
+}
+
+remote_realtime_check() { remote_make gameserver-realtime-check; }
+remote_mobile_firestore_audit() { remote_make gameserver-mobile-firestore-audit; }
+remote_prod_precheck() { remote_make gameserver-prod-precheck; }
+remote_code_ready() { remote_make gameserver-code-ready; }
+remote_deploy_ready() { remote_make gameserver-deploy-ready; }
+remote_dev_tools_adv() {
+  ssh_runner_script <<'EOF'
+set -e
+
+if [ -z "${SUDO_PASSWORD:-}" ]; then
+  echo "❌ Missing SUDO_PASSWORD in remote session"
+  exit 1
+fi
+
+sudo_cmd() {
+  printf '%s\n' "$SUDO_PASSWORD" | sudo -S -p '' "$@"
+}
+
+if ! sudo_cmd -v >/dev/null 2>&1; then
+  echo "❌ sudo authentication failed for RUNNER_USER with provided SUDO_PASSWORD"
+  exit 1
+fi
+
+export DEBIAN_FRONTEND=noninteractive
+
+base_pkgs=(
+  ca-certificates
+  curl
+  git
+  make
+  jq
+  unzip
+  zip
+  rsync
+  tmux
+  ripgrep
+  fzf
+  tree
+  ncdu
+  lsof
+  dnsutils
+  net-tools
+)
+optional_pkgs=(
+  bat
+  btop
+  htop
+  yq
+  httpie
+  gh
+)
+
+sudo_cmd apt-get update
+sudo_cmd apt-get install -y "${base_pkgs[@]}"
+
+for pkg in "${optional_pkgs[@]}"; do
+  if ! sudo_cmd apt-get install -y "$pkg"; then
+    echo "⚠️ Optional package failed: $pkg (continuing)"
+  fi
+done
+
+if command -v batcat >/dev/null 2>&1 && ! command -v bat >/dev/null 2>&1; then
+  sudo_cmd ln -sf "$(command -v batcat)" /usr/local/bin/bat
+fi
+
+# Keep lazydocker install aligned with upstream installer used in this repo.
+curl -fsSL https://raw.githubusercontent.com/jesseduffield/lazydocker/master/scripts/install_update_linux.sh | bash --
+if command -v lazydocker >/dev/null 2>&1; then
+  lazy_bin="$(command -v lazydocker)"
+  if [ "$lazy_bin" != "/usr/local/bin/lazydocker" ]; then
+    sudo_cmd install -m 0755 "$lazy_bin" /usr/local/bin/lazydocker
+  fi
+fi
+
+echo "✅ dev-tools-adv complete"
+echo "--- versions ---"
+for cmd in git docker jq yq rg fzf bat make tmux lazydocker gh; do
+  if command -v "$cmd" >/dev/null 2>&1; then
+    case "$cmd" in
+      docker) "$cmd" --version | head -n 1 ;;
+      lazydocker) "$cmd" --version | head -n 1 ;;
+      *) "$cmd" --version 2>/dev/null | head -n 1 || true ;;
+    esac
+  else
+    echo "$cmd: not installed"
+  fi
+done
+EOF
+}
+remote_install_make() {
+  ssh_runner_script <<'EOF'
+set -e
+
+if [ -z "${SUDO_PASSWORD:-}" ]; then
+  echo "❌ Missing SUDO_PASSWORD in remote session"
+  exit 1
+fi
+
+sudo_cmd() {
+  printf '%s\n' "$SUDO_PASSWORD" | sudo -S -p '' "$@"
+}
+
+if ! sudo_cmd -v >/dev/null 2>&1; then
+  echo "❌ sudo authentication failed for RUNNER_USER with provided SUDO_PASSWORD"
+  exit 1
+fi
+
+export DEBIAN_FRONTEND=noninteractive
+sudo_cmd apt-get update
+sudo_cmd apt-get install -y make
+make --version | head -n 1
+echo "✅ make installed on remote host."
+EOF
+}
+remote_docker_upgrade() {
+  ssh_runner_script <<'EOF'
+set -e
+
+if [ -z "${SUDO_PASSWORD:-}" ]; then
+  echo "❌ Missing SUDO_PASSWORD in remote session"
+  exit 1
+fi
+
+sudo_cmd() {
+  printf '%s\n' "$SUDO_PASSWORD" | sudo -S -p '' "$@"
+}
+
+if ! sudo_cmd -v >/dev/null 2>&1; then
+  echo "❌ sudo authentication failed for RUNNER_USER with provided SUDO_PASSWORD"
+  exit 1
+fi
+
+echo "ℹ️ Upgrading Docker Engine and Compose plugin..."
+install_script="$(mktemp)"
+trap 'rm -f "$install_script"' EXIT
+curl -fsSL https://get.docker.com -o "$install_script"
+sudo_cmd sh "$install_script"
+
+sudo_cmd systemctl enable docker
+sudo_cmd systemctl restart docker
+sudo_cmd usermod -aG docker "$USER"
+
+# Remove stale API pinning that breaks modern daemon negotiation.
+for shell_file in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.profile"; do
+  [ -f "$shell_file" ] || continue
+  sed -i '/^[[:space:]]*export[[:space:]]\+DOCKER_API_VERSION=/d' "$shell_file"
+  sed -i '/^[[:space:]]*DOCKER_API_VERSION=/d' "$shell_file"
+done
+
+echo "✅ Docker upgrade complete"
+docker --version
+docker compose version
+echo "DOCKER_API_VERSION runtime value: ${DOCKER_API_VERSION:-<unset>}"
+echo "ℹ️ Reconnect SSH once so group/env cleanup fully applies, then re-run lazydocker."
+EOF
+}
+remote_docker_fix() {
+  ssh_runner_script <<EOF
+set -e
+
+if [ -z "\${SUDO_PASSWORD:-}" ]; then
+  echo "❌ Missing SUDO_PASSWORD in remote session"
+  exit 1
+fi
+
+sudo_cmd() {
+  printf '%s\n' "\$SUDO_PASSWORD" | sudo -S -p '' "\$@"
+}
+
+if ! sudo_cmd -v >/dev/null 2>&1; then
+  echo "❌ sudo authentication failed for RUNNER_USER with provided SUDO_PASSWORD"
+  exit 1
+fi
+
+export DEBIAN_FRONTEND=noninteractive
+
+if ! command -v docker >/dev/null 2>&1; then
+  echo "ℹ️ Docker binary missing. Installing Docker engine..."
+  install_script="\$(mktemp)"
+  if ! curl -fsSL https://get.docker.com -o "\$install_script"; then
+    rm -f "\$install_script"
+    echo "⚠️ Failed to download get.docker.com install script."
+  elif ! sudo_cmd sh "\$install_script"; then
+    rm -f "\$install_script"
+    echo "⚠️ get.docker.com install failed. Falling back to apt docker.io package."
+    sudo_cmd apt-get update
+    sudo_cmd apt-get install -y docker.io
+  else
+    rm -f "\$install_script"
+  fi
+fi
+
+if ! command -v docker >/dev/null 2>&1; then
+  echo "❌ Docker is still unavailable after repair attempts."
+  exit 1
+fi
+
+sudo_cmd systemctl enable docker
+sudo_cmd systemctl restart docker
+sudo_cmd usermod -aG docker "$RUNNER_USER"
+
+if ! docker compose version >/dev/null 2>&1; then
+  echo "ℹ️ Docker Compose plugin missing. Installing user-scoped plugin..."
+  mkdir -p ~/.docker/cli-plugins
+  arch="\$(uname -m)"
+  case "\$arch" in
+    x86_64|amd64) compose_arch="x86_64" ;;
+    aarch64|arm64) compose_arch="aarch64" ;;
+    *)
+      echo "❌ Unsupported architecture for Docker Compose plugin: \$arch"
+      exit 1
+      ;;
+  esac
+  curl -fsSL "https://github.com/docker/compose/releases/download/v2.25.0/docker-compose-linux-\$compose_arch" \
+    -o ~/.docker/cli-plugins/docker-compose
+  chmod +x ~/.docker/cli-plugins/docker-compose
+fi
+
+echo "✅ Docker repair complete"
+docker --version
+docker compose version
+if groups "$RUNNER_USER" | grep -q '\bdocker\b'; then
+  echo "✅ runner user is in docker group"
+else
+  echo "⚠️ runner user not in docker group yet"
+fi
+echo "ℹ️ If this is your first docker-group add, reconnect SSH once so group changes apply."
+EOF
+}
+remote_up() { remote_make gameserver-up; }
+remote_down() { remote_make gameserver-down; }
+remote_restart() { remote_make gameserver-restart; }
+remote_logs() { remote_make gameserver-logs; }
+remote_web_logs() { remote_make gameserver-web-logs; }
+remote_ps() { remote_make gameserver-ps; }
+remote_health() { remote_make gameserver-health; }
+remote_web_shell() { remote_make gameserver-web-shell; }
+remote_web_smoke() { remote_make gameserver-web-smoke; }
+remote_web_wallboard_smoke() { remote_make gameserver-web-wallboard-smoke; }
+remote_ws_usage() {
+  local minutes="${1:-30}"
+  local limit="${2:-20}"
+  if ! [[ "$minutes" =~ ^[0-9]+$ ]]; then
+    echo "Usage: ./GameServer/connect.sh remote-ws-usage [minutes] [limit]"
+    echo "minutes must be a positive integer."
+    exit 1
+  fi
+  if ! [[ "$limit" =~ ^[0-9]+$ ]]; then
+    echo "Usage: ./GameServer/connect.sh remote-ws-usage [minutes] [limit]"
+    echo "limit must be a positive integer."
+    exit 1
+  fi
+
+  ssh_runner_env_script <<EOF
+set -e
+cd "\$REMOTE_REPO_ROOT"
+set -a
+. "\$REMOTE_ENV_FILE"
+set +a
+docker compose --env-file "\$REMOTE_ENV_FILE" -f GameServer/docker/compose.yml exec -T \
+  -e WS_MINUTES="$minutes" -e WS_LIMIT="$limit" \
+  mongo mongosh --quiet -u "\$MONGO_USER" -p "\$MONGO_PASSWORD" --authenticationDatabase admin fastfingers --eval '
+const minutes = Math.max(1, Number(process.env.WS_MINUTES || "30"));
+const limit = Math.max(1, Number(process.env.WS_LIMIT || "20"));
+const since = new Date(Date.now() - minutes * 60 * 1000);
+const coll = db.getCollection("usage_ws_events");
+printjson({
+  window_minutes: minutes,
+  total_last_window: coll.countDocuments({ ts: { \$gte: since } }),
+  connect_last_window: coll.countDocuments({ event_type: "socket.connect", ts: { \$gte: since } }),
+  sub_leaderboard_last_window: coll.countDocuments({ event_type: /subscribe\\.leaderboard/, ts: { \$gte: since } }),
+  outbound_leaderboard_last_window: coll.countDocuments({ event_type: "leaderboard:update", direction: "outbound", ts: { \$gte: since } })
+});
+print("recent:");
+coll
+  .find({ ts: { \$gte: since } }, { _id: 0, event_type: 1, direction: 1, channel: 1, uid: 1, ts: 1 })
+  .sort({ ts: -1 })
+  .limit(limit)
+  .forEach((x) => printjson(x));
+'
+EOF
+}
+remote_web_auth_debug() { remote_make gameserver-web-auth-debug; }
+remote_web_config_check() { remote_make gameserver-web-config-check; }
+remote_web_rebuild_nocache() {
+  ssh_runner_env_script <<'EOF'
+set -e
+cd "$REMOTE_REPO_ROOT"
+echo "remote cwd: $PWD"
+echo "🔨 Rebuilding web image without cache..."
+docker compose --env-file "$REMOTE_ENV_FILE" -f GameServer/docker/compose.yml build --no-cache web
+echo "🚀 Restarting web service..."
+# Avoid rare stale-name conflicts from interrupted compose restarts.
+docker rm -f web >/dev/null 2>&1 || true
+docker compose --env-file "$REMOTE_ENV_FILE" -f GameServer/docker/compose.yml up -d --force-recreate web
+echo "📊 Web container status:"
+docker compose --env-file "$REMOTE_ENV_FILE" -f GameServer/docker/compose.yml ps web
+EOF
+}
+remote_web_login_check() {
+  ssh_runner_env_script <<'EOF'
+set -e
+cd "$REMOTE_REPO_ROOT"
+echo "remote cwd: $PWD"
+page="$(curl -fsS http://127.0.0.1:3002/login || curl -fsS http://localhost:3002/login)"
+if printf '%s' "$page" | rg -q "invalid_type|NEXT_PUBLIC_FIREBASE_API_KEY|NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN|NEXT_PUBLIC_FIREBASE_PROJECT_ID|NEXT_PUBLIC_FIREBASE_APP_ID"; then
+  echo "❌ Login page still shows Firebase NEXT_PUBLIC env validation errors."
+  exit 1
+fi
+if ! printf '%s' "$page" | rg -q "Fast Fingers Control Room"; then
+  echo "❌ Login page copy is stale; expected 'Fast Fingers Control Room'."
+  exit 1
+fi
+if printf '%s' "$page" | rg -q "Google-authenticated access for game operations|This console requires a Google Firebase account with staff role claim"; then
+  echo "❌ Login page still contains legacy body copy."
+  exit 1
+fi
+echo "✅ Login page check passed (copy + env wiring)."
+EOF
+}
+remote_lazydocker_install() {
+  ssh_runner_script <<EOF
+set -e
+
+if [ -z "\${SUDO_PASSWORD:-}" ]; then
+  echo "❌ Missing SUDO_PASSWORD in remote session"
+  exit 1
+fi
+
+sudo_cmd() {
+  printf '%s\n' "\$SUDO_PASSWORD" | sudo -S -p '' "\$@"
+}
+
+if ! sudo_cmd -v >/dev/null 2>&1; then
+  echo "❌ sudo authentication failed for RUNNER_USER with provided SUDO_PASSWORD"
+  exit 1
+fi
+
+curl -fsSL https://raw.githubusercontent.com/jesseduffield/lazydocker/master/scripts/install_update_linux.sh | bash --
+
+bin_path=""
+if command -v lazydocker >/dev/null 2>&1; then
+  bin_path="\$(command -v lazydocker)"
+elif [ -x "\$HOME/.local/bin/lazydocker" ]; then
+  bin_path="\$HOME/.local/bin/lazydocker"
+elif [ -x "\$HOME/bin/lazydocker" ]; then
+  bin_path="\$HOME/bin/lazydocker"
+fi
+
+if [ -z "\$bin_path" ]; then
+  echo "❌ lazydocker install script finished, but binary was not found in PATH or common user bin paths."
+  exit 1
+fi
+
+sudo_cmd install -m 0755 "\$bin_path" /usr/local/bin/lazydocker
+echo "✅ lazydocker installed: \$(/usr/local/bin/lazydocker --version | head -n 1)"
+EOF
+}
+
+remote_lazydocker() {
+  local target
+  target="$(runner_ssh_target)"
+  ssh -t -p "$NEW_SSH_PORT" "$target" "if command -v lazydocker >/dev/null 2>&1; then api_version=\$(docker version --format '{{.Server.APIVersion}}' 2>/dev/null || true); if [ -z \"\$api_version\" ]; then api_version=1.53; fi; env DOCKER_API_VERSION=\"\$api_version\" lazydocker; else echo 'lazydocker not installed. Run ./GameServer/connect.sh lazydocker-install first.'; exit 1; fi"
+}
+remote_shell_api() { remote_make gameserver-shell-api; }
+remote_shell_mongo() { remote_make gameserver-shell-mongo; }
+remote_shell_postgres() { remote_make gameserver-shell-postgres; }
+remote_shell_redis() { remote_make gameserver-shell-redis; }
+remote_migrate_snapshot() {
+  ssh_runner_env_script <<'EOF'
+set -e
+cd "$REMOTE_REPO_ROOT"
+echo "remote cwd: $PWD"
+docker compose --env-file "$REMOTE_ENV_FILE" -f GameServer/docker/compose.yml exec -T nest-api npm run migrate:snapshot
+EOF
+}
+remote_migrate_dry_run() {
+  ssh_runner_env_script <<'EOF'
+set -e
+cd "$REMOTE_REPO_ROOT"
+echo "remote cwd: $PWD"
+docker compose --env-file "$REMOTE_ENV_FILE" -f GameServer/docker/compose.yml exec -T nest-api npm run migrate:dry-run
+EOF
+}
+remote_migrate_run() {
+  ssh_runner_env_script <<'EOF'
+set -e
+cd "$REMOTE_REPO_ROOT"
+echo "remote cwd: $PWD"
+docker compose --env-file "$REMOTE_ENV_FILE" -f GameServer/docker/compose.yml exec -T nest-api npm run migrate:run
+EOF
+}
+remote_migrate_verify() {
+  ssh_runner_env_script <<'EOF'
+set -e
+cd "$REMOTE_REPO_ROOT"
+echo "remote cwd: $PWD"
+docker compose --env-file "$REMOTE_ENV_FILE" -f GameServer/docker/compose.yml exec -T nest-api npm run migrate:verify
+EOF
+}
+remote_migrate_report() {
+  ssh_runner_env_script <<'EOF'
+set -e
+cd "$REMOTE_REPO_ROOT"
+echo "remote cwd: $PWD"
+docker compose --env-file "$REMOTE_ENV_FILE" -f GameServer/docker/compose.yml exec -T nest-api npm run migrate:report
+EOF
+}
+remote_cutover_precheck() { remote_make cutover-precheck; }
+remote_cutover_execute() { remote_make cutover-execute; }
+remote_cutover_rollback() { remote_make cutover-rollback; }
+remote_swap_ready() { remote_make gameserver-swap-ready; }
+
+remote_api_op() {
+  local op="${1:-}"
+  shift || true
+
+  if [ -z "$op" ]; then
+    echo "Usage: ./GameServer/connect.sh remote-api-op <operation> [--key=value ...]"
+    exit 1
+  fi
+
+  local quoted_op quoted_args
+  quoted_op="$(printf '%q' "$op")"
+  quoted_args=""
+  for arg in "$@"; do
+    quoted_args+=" $(printf '%q' "$arg")"
+  done
+
+  ssh_runner_env_script <<EOF
+set -e
+cd "\$REMOTE_REPO_ROOT"
+docker compose --env-file "\$REMOTE_ENV_FILE" -f GameServer/docker/compose.yml exec -T nest-api npm run api:ops -- --op=$quoted_op$quoted_args
+EOF
+}
+
+#################################
+# MAIN
+#################################
+
+case "${1:-}" in
+  tryconfig) tryconfig ;;
+  setupdev) setupdev ;;
+  init) init ;;
+  status) status ;;
+  security) security ;;
+  resources) resources ;;
+  update) update ;;
+  release-upgrade) release_upgrade ;;
+  sync) sync_remote ;;
+  sync-force) sync_remote_force ;;
+  remote-env-push) remote_env_push ;;
+  remote-env-validate) remote_env_validate ;;
+  remote-drift) remote_drift ;;
+  remote-status) remote_status ;;
+  remote-realtime-check) remote_realtime_check ;;
+  remote-mobile-firestore-audit) remote_mobile_firestore_audit ;;
+  remote-prod-precheck) remote_prod_precheck ;;
+  remote-code-ready) remote_code_ready ;;
+  remote-deploy-ready) remote_deploy_ready ;;
+  dev-tools-adv) remote_dev_tools_adv ;;
+  remote-install-make) remote_install_make ;;
+  docker-upgrade) remote_docker_upgrade ;;
+  docker-fix) remote_docker_fix ;;
+  remote-up) remote_up ;;
+  remote-down) remote_down ;;
+  remote-restart) remote_restart ;;
+  remote-logs) remote_logs ;;
+  remote-web-logs) remote_web_logs ;;
+  remote-ps) remote_ps ;;
+  remote-health) remote_health ;;
+  remote-web-shell) remote_web_shell ;;
+  remote-web-smoke) remote_web_smoke ;;
+  remote-web-wallboard-smoke) remote_web_wallboard_smoke ;;
+  remote-ws-usage) remote_ws_usage "${2:-30}" "${3:-20}" ;;
+  remote-web-auth-debug) remote_web_auth_debug ;;
+  remote-web-config-check) remote_web_config_check ;;
+  remote-web-rebuild-nocache) remote_web_rebuild_nocache ;;
+  remote-web-login-check) remote_web_login_check ;;
+  lazydocker-install) remote_lazydocker_install ;;
+  lazydocker) remote_lazydocker ;;
+  remote-shell-api) remote_shell_api ;;
+  remote-shell-mongo) remote_shell_mongo ;;
+  remote-shell-postgres) remote_shell_postgres ;;
+  remote-shell-redis) remote_shell_redis ;;
+  remote-migrate-snapshot) remote_migrate_snapshot ;;
+  remote-migrate-dry-run) remote_migrate_dry_run ;;
+  remote-migrate-run) remote_migrate_run ;;
+  remote-migrate-verify) remote_migrate_verify ;;
+  remote-migrate-report) remote_migrate_report ;;
+  remote-cutover-precheck) remote_cutover_precheck ;;
+  remote-cutover-execute) remote_cutover_execute ;;
+  remote-cutover-rollback) remote_cutover_rollback ;;
+  remote-swap-ready) remote_swap_ready ;;
+  remote-api-op) remote_api_op "${2:-}" "${@:3}" ;;
+  *)
+    target="$(runner_ssh_target)"
+    ssh -p "$NEW_SSH_PORT" "$target"
+    ;;
+esac
