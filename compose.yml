@@ -1,8 +1,10 @@
 services:
   api:
-    image: ghcr.io/saleor/saleor:3.22
+    build:
+      context: ./saleor
+      dockerfile: Dockerfile
     ports:
-      - 8000:8000
+      - 28000:8000
     restart: unless-stopped
     networks:
       - saleor-backend-tier
@@ -15,23 +17,41 @@ services:
     volumes:
       # shared volume between worker and api for media
       - saleor-media:/app/media
+      # Hot reload: mount source code for development
+      - ./saleor:/app:z
     env_file:
       - common.env
       - backend.env
     environment:
-      - DASHBOARD_URL=http://localhost:9000/
+      - DASHBOARD_URL=http://localhost:29000/
       - ALLOWED_HOSTS=localhost,127.0.0.1,api
+      - ALLOWED_GRAPHQL_ORIGINS=http://localhost:29000,http://127.0.0.1:29000
 
   dashboard:
-    image: ghcr.io/saleor/saleor-dashboard:latest
+    build:
+      context: ./saleor-dashboard
+      dockerfile: Dockerfile
+      args:
+        API_URL: http://localhost:28000/graphql/
     ports:
-      - 9000:80
+      - 29000:80
     restart: unless-stopped
+    networks:
+      - saleor-backend-tier
+    volumes:
+      # Hot reload: mount source code for development
+      - ./saleor-dashboard/src:/app/src:z
+      - ./saleor-dashboard/public:/app/public:z
+      - ./saleor-dashboard/package.json:/app/package.json:z
+      - ./saleor-dashboard/tsconfig.json:/app/tsconfig.json:z
+    environment:
+      - API_URL=http://localhost:28000/graphql/
+      - CHOKIDAR_USEPOLLING=true
 
   db:
     image: library/postgres:15-alpine
     ports:
-      - 5432:5432
+      - 25432:5432
     restart: unless-stopped
     networks:
       - saleor-backend-tier
@@ -45,7 +65,7 @@ services:
   cache:
     image: valkey/valkey:8.1-alpine
     ports:
-      - 6379:6379
+      - 26379:6379
     restart: unless-stopped
     networks:
       - saleor-backend-tier
@@ -53,7 +73,9 @@ services:
       - saleor-cache:/data
 
   worker:
-    image: ghcr.io/saleor/saleor:3.22
+    build:
+      context: ./saleor
+      dockerfile: Dockerfile
     command: celery -A saleor --app=saleor.celeryconf:app worker --loglevel=info -B
     restart: unless-stopped
     networks:
@@ -67,13 +89,15 @@ services:
     volumes:
       # shared volume between worker and api for media
       - saleor-media:/app/media
+      # Hot reload: mount source code for development
+      - ./saleor:/app:z
 
   jaeger:
     image: jaegertracing/jaeger
     ports:
-      - "16686:16686"
-      - "4317:4317"
-      - "4318:4318"
+      - "28686:16686"
+      - "24317:4317"
+      - "24318:4318"
     restart: unless-stopped
     networks:
       - saleor-backend-tier
@@ -84,8 +108,8 @@ services:
   mailpit:
     image: axllent/mailpit
     ports:
-      - 1025:1025 # smtp server
-      - 8025:8025 # web ui. Visit http://localhost:8025/ to check emails
+      - 21025:1025 # smtp server
+      - 28025:8025 # web ui. Visit http://localhost:28025/ to check emails
     restart: unless-stopped
     networks:
       - saleor-backend-tier
